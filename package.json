@@ -1,0 +1,10 @@
+{
+  "name": "secretary-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "telegraf": "^4.15.0",
+    "firebase": "^10.7.1",
+    "express": "^4.18.2"
+  }
+}
