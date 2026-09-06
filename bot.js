@@ -21,11 +21,7 @@ const isAdmin = (id) => ADMIN_IDS.includes(id);
 const LOG_GROUP_ID = -1003947557816;
 const CANAL_ID = -1004406033994;
 
-const menuPrincipal = () => Markup.inlineKeyboard([
-  [Markup.button.callback('🛍️ Tienda','menu_tienda'), Markup.button.callback('🛒 Carrito','ver_carrito')],
-  [Markup.button.callback('🤖 Chatbot','menu_chatbot'), Markup.button.callback('📦 Módulos','ver_modulos')],
-]);
-
+// === FUNCIONES TEMAS ===
 async function getOrCreateTopic(userId, userName){
   const ref = doc(db, "topics", String(userId));
   const snap = await getDoc(ref);
@@ -33,105 +29,167 @@ async function getOrCreateTopic(userId, userName){
   try{
     const topic = await bot.telegram.createForumTopic(LOG_GROUP_ID, `${userName}`.substring(0,80));
     await setDoc(ref, { userId: String(userId), userName, topicId: topic.message_thread_id, creado: new Date().toISOString() });
-    await bot.telegram.sendMessage(LOG_GROUP_ID, `👤 Nuevo: ${userName}\nID: ${userId}`, {message_thread_id: topic.message_thread_id});
     return topic.message_thread_id;
-  }catch(e){ console.log('Error topic', e.message); return null; }
+  }catch(e){ return null; }
 }
 
+// === MÓDULO MENÚS ===
+async function mostrarMenu(ctx, menuId){
+  const ref = doc(db, "menus", menuId.toLowerCase());
+  const snap = await getDoc(ref);
+  if(!snap.exists()){
+    // si no existe y es principal, muestra el default
+    if(menuId==='principal'){
+      return ctx.reply('👋 Menú Principal\n\nUsa /crear_menu para crear tu primer menú',
+        Markup.inlineKeyboard([[Markup.button.callback('🛍️ Tienda','menu_tienda')]]));
+    }
+    return ctx.reply('❌ Menú no encontrado');
+  }
+  const data = snap.data();
+  let botones = [];
+  if(data.botones && data.botones.length>0){
+    // 2 botones por fila
+    for(let i=0;i<data.botones.length;i+=2){
+      let fila = [];
+      fila.push(Markup.button.callback(data.botones[i].texto, `nav_${data.botones[i].valor}`));
+      if(data.botones[i+1]) fila.push(Markup.button.callback(data.botones[i+1].texto, `nav_${data.botones[i+1].valor}`));
+      botones.push(fila);
+    }
+  }
+  // Botón volver si no es principal
+  if(menuId!=='principal' && data.parent!=='principal'){
+    botones.push([Markup.button.callback('⬅️ Volver','nav_principal')]);
+  }
+  try{
+    // Intenta copiar del canal si tiene mensaje premium
+    if(data.canalMsgId){
+      await bot.telegram.copyMessage(ctx.chat.id, CANAL_ID, data.canalMsgId, {reply_markup: {inline_keyboard: botones}});
+    }else{
+      await ctx.reply(data.texto, Markup.inlineKeyboard(botones));
+    }
+  }catch(e){ await ctx.reply(data.texto, Markup.inlineKeyboard(botones)); }
+}
+
+// SCENES
+const crearMenuScene = new Scenes.WizardScene('crear_menu',
+  async (ctx) => {
+    ctx.wizard.state.menuId = ctx.message.text.split(' ')[1]?.toLowerCase();
+    if(!ctx.wizard.state.menuId) return ctx.reply('Uso: /crear_menu nombre\nEj: /crear_menu tienda'), ctx.scene.leave();
+    await ctx.reply(`📝 Escribe el texto para el menú "${ctx.wizard.state.menuId}":\n\nPuedes usar emojis premium, los copiaré del canal después.\n/cancelar para salir`);
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    const texto = ctx.message.text;
+    const menuId = ctx.wizard.state.menuId;
+    await setDoc(doc(db,"menus", menuId), { id: menuId, texto, botones:[], parent: menuId==='principal'? null : 'principal', creado: new Date().toISOString() });
+    await ctx.reply(`✅ Menú "${menuId}" creado!\n\nAhora agrega botones con:\n/agregar_boton ${menuId} | Texto | submenu | id_destino\n\nEjemplo:\n/agregar_boton ${menuId} | 👗 Ropa | submenu | ropa`);
+    return ctx.scene.leave();
+  }
+);
+
+const stage = new Scenes.Stage([crearMenuScene]);
+bot.use(session()); bot.use(stage.middleware());
+
+// COMANDOS MENÚ
+bot.command('crear_menu', (ctx) => { if(!isAdmin(ctx.from.id)) return; ctx.scene.enter('crear_menu'); });
+bot.command('ver_menus', async (ctx) => {
+  if(!isAdmin(ctx.from.id)) return;
+  const snap = await getDocs(collection(db,"menus"));
+  let t='📂 Tus menús:\n\n'; snap.forEach(d=>{ const b=d.data().botones?.length||0; t+=`• ${d.id} (${b} botones) - ${d.data().texto.substring(0,30)}...\n`; });
+  ctx.reply(t||'Vacío, usa /crear_menu principal');
+});
+bot.command('borrar_menu', async (ctx) => {
+  if(!isAdmin(ctx.from.id)) return;
+  const id = ctx.message.text.split(' ')[1]?.toLowerCase();
+  if(!id) return ctx.reply('Uso: /borrar_menu tienda');
+  await deleteDoc(doc(db,"menus", id)); ctx.reply(`🗑️ Menú ${id} borrado`);
+});
+bot.command('agregar_boton', async (ctx) => {
+  if(!isAdmin(ctx.from.id)) return;
+  // formato: /agregar_boton tienda | Ropa | submenu | ropa
+  const args = ctx.message.text.replace('/agregar_boton','').split('|').map(s=>s.trim());
+  if(args.length<4) return ctx.reply('Uso:\n/agregar_boton menu_origen | Texto boton | submenu | menu_destino\n\nEj:\n/agregar_boton principal | 🛍️ Tienda | submenu | tienda\n/agregar_boton tienda | ⬅️ Volver | submenu | principal');
+  const [origen, textoBtn, tipo, destino] = args;
+  const ref = doc(db,"menus", origen.toLowerCase());
+  const snap = await getDoc(ref);
+  if(!snap.exists()) return ctx.reply(`❌ Menú origen "${origen}" no existe`);
+  const data = snap.data();
+  const botones = data.botones||[];
+  botones.push({ texto: textoBtn, tipo, valor: destino.toLowerCase() });
+  await setDoc(ref, {...data, botones}, {merge:true});
+  ctx.reply(`✅ Botón agregado a "${origen}":\n${textoBtn} → ${destino}`);
+});
+bot.command('vincular_canal', async (ctx) => {
+  if(!isAdmin(ctx.from.id)) return;
+  // /vincular_canal tienda -> responde a mensaje reenviado del canal
+  const menuId = ctx.message.text.split(' ')[1]?.toLowerCase();
+  if(!menuId) return ctx.reply('Uso: reenvía msg del canal aquí y responde /vincular_canal tienda');
+  if(!ctx.message.reply_to_message) return ctx.reply('Responde a un mensaje reenviado del canal');
+  const fwd = ctx.message.reply_to_message;
+  const realMsgId = fwd.forward_from_message_id || fwd.message_id;
+  const ref = doc(db,"menus", menuId);
+  const snap = await getDoc(ref);
+  if(!snap.exists()) return ctx.reply('Menú no existe');
+  await setDoc(ref, {canalMsgId: realMsgId}, {merge:true});
+  ctx.reply(`✨ Menú "${menuId}" vinculado a mensaje premium ${realMsgId} del canal`);
+});
+
+// COMANDOS CANAL PREMIUM (ya los tenías)
 bot.command('guardar', async (ctx) => {
   if(String(ctx.chat.id)!==String(LOG_GROUP_ID)) return;
   const keyword = ctx.message.text.split(' ')[1]?.toLowerCase();
-  if(!keyword) return ctx.reply('Uso:\n1. Reenvía un mensaje de tu canal -1004406033994 aquí\n2. Respóndele con: /guardar hola');
-  if(!ctx.message.reply_to_message) return ctx.reply('⚠️ Responde a un mensaje reenviado del canal');
+  if(!keyword) return ctx.reply('Uso: /guardar hola');
+  if(!ctx.message.reply_to_message) return ctx.reply('Responde a msg del canal');
   const fwd = ctx.message.reply_to_message;
   const realMsgId = fwd.forward_from_message_id || fwd.message_id;
-  const realChannelId = fwd.forward_from_chat?.id || CANAL_ID;
-  await setDoc(doc(db,"respuestas_canal", keyword), { keyword, channelId: realChannelId, messageId: realMsgId, vista: fwd.text||fwd.caption||'media' });
-  ctx.reply(`✅ ¡Guardado jefa!\n🔑 Palabra: "${keyword}"\n📨 ID Mensaje: ${realMsgId}\n\nAhora escribe "${keyword}" desde otra cuenta para probar`);
+  await setDoc(doc(db,"respuestas_canal", keyword), { keyword, channelId: CANAL_ID, messageId: realMsgId });
+  ctx.reply(`✅ Guardado ${keyword} → ${realMsgId}`);
 });
-
-bot.command('ver_respuestas', async (ctx) => {
-  if(!isAdmin(ctx.from.id)) return;
-  const snap = await getDocs(collection(db,"respuestas_canal"));
-  let t='📦 Respuestas premium guardadas:\n\n'; snap.forEach(d=> t+= `• ${d.id} → msg ${d.data().messageId}\n`);
-  ctx.reply(t||'Vacío');
-});
-
-bot.command('borrar_respuesta', async (ctx) => {
-  if(!isAdmin(ctx.from.id)) return;
-  const k = ctx.message.text.split(' ')[1]?.toLowerCase();
-  await deleteDoc(doc(db,"respuestas_canal", k)); ctx.reply(`🗑️ Borrado ${k}`);
-});
-
-const bienvenidaScene = new Scenes.WizardScene('set_bienvenida',
-  (ctx) => { ctx.reply('Envía tu bienvenida con {nombre} /cancelar'); return ctx.wizard.next(); },
-  async (ctx) => { await setDoc(doc(db, "config", "bienvenida"), {texto: ctx.message.text, entidades: ctx.message.entities||[]}); ctx.reply(`✅ Guardada`); return ctx.scene.leave(); }
-);
-const stage = new Scenes.Stage([bienvenidaScene]);
-bot.use(session()); bot.use(stage.middleware());
-
-bot.start(async (ctx) => {
-  if(isAdmin(ctx.from.id)) return ctx.reply(`👑 Hola jefa ${ctx.from.first_name}`, menuPrincipal());
-  try{
-    let texto=`Hola {nombre} bienvenida ✨`; let entidades=[];
-    const snap=await getDoc(doc(db,"config","bienvenida"));
-    if(snap.exists()){ texto=snap.data().texto; entidades=snap.data().entidades||[]; }
-    const finalTexto = texto.replace('{nombre}', ctx.from.first_name);
-    try{ await ctx.reply(finalTexto, {entities: entidades,...menuPrincipal()}); }catch{ await ctx.reply(finalTexto, menuPrincipal()); }
-    const topicId = await getOrCreateTopic(ctx.from.id, `${ctx.from.first_name} ${ctx.from.last_name||''}`.trim());
-    if(topicId) await bot.telegram.sendMessage(LOG_GROUP_ID, `💬 /start de ${ctx.from.first_name}`, {message_thread_id: topicId});
-  }catch(e){ console.log(e); }
-});
-
-bot.on('business_message', async (ctx) => {
-  try{
-    const msg = ctx.businessMessage || ctx.message; const clienteId = msg.from.id;
-    if(isAdmin(clienteId)) return;
-    const topicId = await getOrCreateTopic(clienteId, `${msg.from.first_name||'Cliente'}`);
-    if(!topicId) return;
-    await bot.telegram.sendMessage(LOG_GROUP_ID, `💼 Business ${msg.from.first_name}:\n${msg.text||'media'}`, {message_thread_id: topicId});
-  }catch(e){ console.log(e); }
-});
-
 bot.command('r', async (ctx) => {
   if(String(ctx.chat.id)!==String(LOG_GROUP_ID)) return; if(!isAdmin(ctx.from.id)) return;
-  const threadId=ctx.message.message_thread_id; if(!threadId) return ctx.reply('Dentro del tema');
-  const texto=ctx.message.text.replace('/r','').trim(); if(!texto) return ctx.reply('Uso: /r Hola');
+  const threadId=ctx.message.message_thread_id; if(!threadId) return;
+  const texto=ctx.message.text.replace('/r','').trim();
   const snap=await getDocs(collection(db,"topics")); let userFound=null; snap.forEach(d=>{ if(d.data().topicId===threadId) userFound=d.data(); });
-  if(!userFound) return ctx.reply('No encontré usuario');
-  try{ await bot.telegram.sendMessage(Number(userFound.userId), texto); await ctx.reply(`✅ Enviado a ${userFound.userName}`); await bot.telegram.sendMessage(LOG_GROUP_ID, `👩‍💼 Tú: ${texto}`, {message_thread_id: threadId}); }catch(e){ ctx.reply(`❌ ${e.message}`); }
+  if(!userFound) return;
+  try{ await bot.telegram.sendMessage(Number(userFound.userId), texto); await ctx.reply(`✅ Enviado`); }catch(e){ ctx.reply(e.message); }
 });
 
+// NAVEGACIÓN
+bot.action(/nav_(.+)/, async (ctx) => {
+  const destino = ctx.match[1];
+  ctx.answerCbQuery();
+  // Si es una respuesta del canal
+  const snapCanal = await getDoc(doc(db,"respuestas_canal", destino));
+  if(snapCanal.exists()){
+    const d = snapCanal.data();
+    await bot.telegram.copyMessage(ctx.chat.id, d.channelId, d.messageId).catch(()=>{});
+    return;
+  }
+  // Si es un menú
+  await mostrarMenu(ctx, destino);
+});
+
+bot.start(async (ctx) => {
+  if(isAdmin(ctx.from.id)) return ctx.reply(`👑 Hola jefa\nUsa /ver_menus /crear_menu`, Markup.inlineKeyboard([[Markup.button.callback('📂 Ver menús','ver_menus_btn')]]));
+  await mostrarMenu(ctx, 'principal');
+  const topicId = await getOrCreateTopic(ctx.from.id, `${ctx.from.first_name}`);
+  if(topicId) await bot.telegram.sendMessage(LOG_GROUP_ID, `💬 /start ${ctx.from.first_name}`, {message_thread_id: topicId}).catch(()=>{});
+});
+bot.action('ver_menus_btn', async (ctx) => { const snap = await getDocs(collection(db,"menus")); let t='📂 Menús:\n'; snap.forEach(d=> t+=`• ${d.id}\n`); ctx.answerCbQuery(); ctx.reply(t); });
+bot.command('menu', (ctx) => mostrarMenu(ctx, 'principal'));
 bot.on('text', async (ctx) => {
   if(String(ctx.chat.id)===String(LOG_GROUP_ID)) return;
   if(isAdmin(ctx.from.id) && ctx.message.text.startsWith('/')) return; if(isAdmin(ctx.from.id)) return;
-  const textoUsuario = ctx.message.text.toLowerCase();
-  const topicId = await getOrCreateTopic(ctx.from.id, `${ctx.from.first_name} ${ctx.from.last_name||''}`.trim());
-  if(!topicId) return;
-  await bot.telegram.sendMessage(LOG_GROUP_ID, `💬 ${ctx.from.first_name}:\n${ctx.message.text}`, {message_thread_id: topicId}).catch(()=>{});
+  const topicId = await getOrCreateTopic(ctx.from.id, `${ctx.from.first_name}`);
+  if(topicId) await bot.telegram.sendMessage(LOG_GROUP_ID, `💬 ${ctx.from.first_name}:\n${ctx.message.text}`, {message_thread_id: topicId}).catch(()=>{});
   const snap = await getDocs(collection(db,"respuestas_canal"));
   for(const d of snap.docs){
-    if(textoUsuario.includes(d.data().keyword.toLowerCase())){
-      const data = d.data();
-      try{
-        await bot.telegram.copyMessage(ctx.chat.id, data.channelId, data.messageId);
-        await bot.telegram.sendMessage(LOG_GROUP_ID, `🤖 Auto canal: ${d.id}`, {message_thread_id: topicId}).catch(()=>{});
-      }catch(e){ ctx.reply('❌ Error: bot no es admin del canal'); }
-      return;
+    if(ctx.message.text.toLowerCase().includes(d.data().keyword.toLowerCase())){
+      const data = d.data(); await bot.telegram.copyMessage(ctx.chat.id, data.channelId, data.messageId).catch(()=>{}); return;
     }
   }
 });
 
-bot.command('menu', (ctx) => ctx.reply('Menú:', menuPrincipal()));
-bot.command('set_bienvenida', (ctx) => { if(isAdmin(ctx.from.id)) ctx.scene.enter('set_bienvenida'); });
-bot.command('cancelar', (ctx) => { ctx.scene.leave(); ctx.reply('Cancelado'); });
-bot.action('menu_principal', (ctx) => { ctx.answerCbQuery(); ctx.reply('Menú:', menuPrincipal()); });
-bot.action('menu_tienda', (ctx) => { ctx.answerCbQuery(); ctx.reply('🛍️ Tienda pronto', menuPrincipal()); });
-bot.action('ver_carrito', (ctx) => { ctx.answerCbQuery(); ctx.reply('🛒 Vacío', menuPrincipal()); });
-bot.action('menu_chatbot', (ctx) => { ctx.answerCbQuery(); ctx.reply('🤖 Panel', Markup.inlineKeyboard([[Markup.button.callback('📦 Ver respuestas','ver_resp'), Markup.button.callback('✨ Bienvenida','set_bien')], [Markup.button.callback('⬅️','menu_principal')]])); });
-bot.action('ver_resp', async (ctx) => { const snap = await getDocs(collection(db,"respuestas_canal")); let t='📦 Guardadas:\n'; snap.forEach(d=> t+=`• ${d.id}\n`); ctx.answerCbQuery(); ctx.reply(t); });
-bot.action('set_bien', (ctx) => { ctx.answerCbQuery(); ctx.scene.enter('set_bienvenida'); });
-
 await bot.telegram.deleteWebhook({drop_pending_updates:true}).catch(()=>{});
-bot.launch().then(()=> console.log('✅ V6.0 CANAL -1004406033994 ON'));
-const app=express(); app.get('/', (req,res)=>res.send('V6 ON')); app.listen(process.env.PORT||3000);
+bot.launch().then(()=> console.log('✅ V7.0 MENÚS ON'));
+const app=express(); app.get('/', (req,res)=>res.send('V7 ON')); app.listen(process.env.PORT||3000);
